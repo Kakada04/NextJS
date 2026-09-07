@@ -29,6 +29,7 @@ interface UploadTask {
   lastTime?: number;
   lastLoaded?: number;
   smoothedSpeed?: number;
+  chunkInfo?: string;
 }
 
 const GATEWAY_URL = process.env.NEXT_PUBLIC_GATEWAY_URL || "https://intention-conditions-avon-relief.trycloudflare.com";
@@ -124,8 +125,10 @@ export default function Home() {
     setQueue((prev) => prev.filter((item) => item.id !== id));
   };
 
-  // Single file upload worker (Direct to Standalone MediaService)
-  const uploadSingleTask = async (task: UploadTask): Promise<void> => {
+  const CHUNK_SIZE = 10 * 1024 * 1024; // 10MB per chunk to bypass Cloudflare 100MB payload limit
+
+  // Direct single-stream upload for smaller files (<= 10MB)
+  const uploadDirectTask = async (task: UploadTask): Promise<void> => {
     return new Promise((resolve) => {
       try {
         const formData = new FormData();
@@ -141,7 +144,6 @@ export default function Home() {
           prev.map((t) => (t.id === task.id ? { ...t, status: "uploading", xhr } : t))
         );
 
-        // Direct upload to Standalone MediaService endpoint
         xhr.open("POST", `${GATEWAY_URL}/api/v1/upload`);
 
         xhr.upload.onprogress = (event) => {
@@ -263,6 +265,232 @@ export default function Home() {
         resolve();
       }
     });
+  };
+
+  // Resumable chunked upload for large files (> 10MB)
+  const uploadChunkedTask = async (task: UploadTask): Promise<void> => {
+    return new Promise(async (resolve) => {
+      const uploadId = `up_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+      const totalSize = task.file.size;
+      const totalChunks = Math.ceil(totalSize / CHUNK_SIZE);
+
+      let isAborted = false;
+      task.lastTime = performance.now();
+      task.lastLoaded = 0;
+      task.smoothedSpeed = 0;
+
+      setQueue((prev) =>
+        prev.map((t) =>
+          t.id === task.id
+            ? {
+                ...t,
+                status: "uploading",
+                progress: 0,
+                loaded: 0,
+                total: totalSize,
+                chunkInfo: `Chunk 1/${totalChunks}`,
+              }
+            : t
+        )
+      );
+
+      for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+        if (isAborted) break;
+
+        const start = chunkIndex * CHUNK_SIZE;
+        const end = Math.min(totalSize, start + CHUNK_SIZE);
+        const chunkBlob = task.file.slice(start, end);
+
+        let chunkSuccess = false;
+        let lastErrorMsg = "";
+
+        // Retry up to 3 times per chunk on network hiccup
+        for (let attempt = 0; attempt < 3; attempt++) {
+          if (isAborted) break;
+
+          try {
+            const result = await new Promise<{
+              ok: boolean;
+              data?: any;
+              status: number;
+              aborted?: boolean;
+            }>((res) => {
+              const xhr = new XMLHttpRequest();
+              task.xhr = xhr;
+
+              xhr.upload.onprogress = (event) => {
+                if (event.lengthComputable) {
+                  const currentTotalLoaded = Math.min(totalSize, start + event.loaded);
+                  const now = performance.now();
+                  const timeDiff = (now - (task.lastTime || now)) / 1000;
+
+                  let smoothed = task.smoothedSpeed || 0;
+                  if (timeDiff >= 0.15 || currentTotalLoaded === totalSize) {
+                    const bytesDiff = currentTotalLoaded - (task.lastLoaded || 0);
+                    const instantSpeed = timeDiff > 0 ? bytesDiff / timeDiff : 0;
+                    smoothed = smoothed === 0 ? instantSpeed : smoothed * 0.7 + instantSpeed * 0.3;
+                    task.smoothedSpeed = smoothed;
+                    task.lastTime = now;
+                    task.lastLoaded = currentTotalLoaded;
+                  }
+
+                  const remaining = Math.max(0, totalSize - currentTotalLoaded);
+                  const eta = smoothed > 0 ? Math.ceil(remaining / smoothed) : 0;
+                  const progress = Math.min(99, Math.round((currentTotalLoaded / totalSize) * 100));
+
+                  setQueue((prev) =>
+                    prev.map((t) =>
+                      t.id === task.id
+                        ? {
+                            ...t,
+                            status: "uploading",
+                            progress,
+                            loaded: currentTotalLoaded,
+                            total: totalSize,
+                            speedBytesPerSec: smoothed,
+                            etaSec: eta,
+                            chunkInfo: `Chunk ${chunkIndex + 1}/${totalChunks}`,
+                          }
+                        : t
+                    )
+                  );
+                }
+              };
+
+              xhr.onload = () => {
+                if (xhr.status >= 200 && xhr.status < 300) {
+                  try {
+                    const json = JSON.parse(xhr.responseText);
+                    res({ ok: true, data: json, status: xhr.status });
+                  } catch {
+                    res({ ok: true, status: xhr.status });
+                  }
+                } else {
+                  let msg = `HTTP ${xhr.status}`;
+                  try {
+                    const err = JSON.parse(xhr.responseText);
+                    if (err.message || err.error) msg = err.message || err.error;
+                  } catch {}
+                  res({ ok: false, status: xhr.status, data: msg });
+                }
+              };
+
+              xhr.onerror = () => {
+                res({ ok: false, status: 0, data: "Network error during chunk upload" });
+              };
+
+              xhr.onabort = () => {
+                isAborted = true;
+                res({ ok: false, status: 0, aborted: true });
+              };
+
+              xhr.open("POST", `${GATEWAY_URL}/api/v1/upload-chunk`);
+
+              const formData = new FormData();
+              // Append fields before chunk file for streaming multipart parser
+              formData.append("uploadId", uploadId);
+              formData.append("chunkIndex", chunkIndex.toString());
+              formData.append("totalChunks", totalChunks.toString());
+              formData.append("originalName", task.file.name);
+              formData.append("mimeType", task.file.type || "application/octet-stream");
+              formData.append("totalSize", totalSize.toString());
+              formData.append("chunk", chunkBlob, task.file.name);
+
+              xhr.send(formData);
+            });
+
+            if (result.aborted) {
+              isAborted = true;
+              fetch(`${GATEWAY_URL}/api/v1/upload-chunk/${uploadId}`, { method: "DELETE" }).catch(() => {});
+              setQueue((prev) =>
+                prev.map((t) =>
+                  t.id === task.id ? { ...t, status: "canceled", speedBytesPerSec: 0, chunkInfo: undefined } : t
+                )
+              );
+              resolve();
+              return;
+            }
+
+            if (result.ok) {
+              chunkSuccess = true;
+              if (chunkIndex === totalChunks - 1 && result.data) {
+                // Final chunk merged successfully!
+                const mediaData = result.data;
+                const newFile: FileItem = {
+                  id: mediaData.file_id,
+                  file_id: mediaData.file_id,
+                  original_name: mediaData.original_name || task.file.name,
+                  mime_type: mediaData.mime_type || task.file.type,
+                  size_bytes: mediaData.size_bytes || task.file.size,
+                  url: mediaData.url,
+                  thumbnail_url: mediaData.thumbnail_url || null,
+                  created_at: new Date().toISOString(),
+                  category: mediaData.category,
+                  relative_path: mediaData.relative_path,
+                };
+
+                setFiles((prev) => {
+                  const updated = [newFile, ...prev];
+                  try {
+                    localStorage.setItem("media_service_files", JSON.stringify(updated));
+                  } catch {}
+                  return updated;
+                });
+
+                setQueue((prev) =>
+                  prev.map((t) =>
+                    t.id === task.id
+                      ? {
+                          ...t,
+                          status: "completed",
+                          progress: 100,
+                          loaded: totalSize,
+                          speedBytesPerSec: 0,
+                          etaSec: 0,
+                          chunkInfo: `Done (${totalChunks} chunks)`,
+                        }
+                      : t
+                  )
+                );
+                resolve();
+                return;
+              }
+              break; // Proceed to next chunk
+            } else {
+              lastErrorMsg = typeof result.data === "string" ? result.data : `HTTP ${result.status}`;
+            }
+          } catch (err: unknown) {
+            lastErrorMsg = err instanceof Error ? err.message : "Chunk upload error";
+          }
+        }
+
+        if (!chunkSuccess && !isAborted) {
+          fetch(`${GATEWAY_URL}/api/v1/upload-chunk/${uploadId}`, { method: "DELETE" }).catch(() => {});
+          setQueue((prev) =>
+            prev.map((t) =>
+              t.id === task.id
+                ? {
+                    ...t,
+                    status: "error",
+                    errorMessage: `Chunk ${chunkIndex + 1}/${totalChunks} failed: ${lastErrorMsg}`,
+                    speedBytesPerSec: 0,
+                  }
+                : t
+            )
+          );
+          resolve();
+          return;
+        }
+      }
+    });
+  };
+
+  // Upload worker: dispatches to chunked upload if file > 10MB
+  const uploadSingleTask = async (task: UploadTask): Promise<void> => {
+    if (task.file.size > CHUNK_SIZE) {
+      return uploadChunkedTask(task);
+    }
+    return uploadDirectTask(task);
   };
 
   // Upload all pending tasks concurrently
@@ -593,14 +821,21 @@ export default function Home() {
                       {/* Status / Speed Indicator */}
                       <div className="flex items-center gap-2 shrink-0">
                         {task.status === "uploading" && (
-                          <span className="font-mono text-emerald-400 font-semibold text-[11px]">
-                            {(task.speedBytesPerSec / (1024 * 1024)).toFixed(1)} MB/s
-                          </span>
+                          <div className="flex items-center gap-1.5">
+                            {task.chunkInfo && (
+                              <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">
+                                {task.chunkInfo}
+                              </span>
+                            )}
+                            <span className="font-mono text-emerald-400 font-semibold text-[11px]">
+                              {(task.speedBytesPerSec / (1024 * 1024)).toFixed(1)} MB/s
+                            </span>
+                          </div>
                         )}
 
                         {task.status === "completed" && (
                           <span className="px-2 py-0.5 rounded bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-[10px] font-semibold">
-                            ✓ Done
+                            ✓ Done {task.chunkInfo ? `(${task.chunkInfo})` : ""}
                           </span>
                         )}
 
