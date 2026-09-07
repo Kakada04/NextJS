@@ -557,17 +557,12 @@ export default function Home() {
     if (!confirm(`Are you sure you want to delete "${file.original_name}"?`)) return;
     try {
       // 1. Delete from Standalone MediaService
-      const pathParam = file.relative_path || file.url.replace(/^\/files\//, "");
+      const raw = file.relative_path || file.url.replace(/^\/files\/?/, "");
+      const pathParam = raw.replace(/^\/+/, "");
       await fetch(`${GATEWAY_URL}/api/v1/files/${pathParam}`, { method: "DELETE" });
 
-      // 2. Remove from local list and update localStorage
-      setFiles((prev) => {
-        const updated = prev.filter((f) => f.file_id !== file.file_id && f.id !== file.id);
-        try {
-          localStorage.setItem("media_service_files", JSON.stringify(updated));
-        } catch {}
-        return updated;
-      });
+      // 2. Refresh files from server
+      await fetchFiles();
     } catch (err) {
       console.error("Failed to delete file:", err);
     }
@@ -586,7 +581,8 @@ export default function Home() {
       const filesToDelete = [...files];
       await Promise.allSettled(
         filesToDelete.map((file) => {
-          const pathParam = file.relative_path || file.url.replace(/^\/files\//, "");
+          const raw = file.relative_path || file.url.replace(/^\/files\/?/, "");
+          const pathParam = raw.replace(/^\/+/, "");
           return fetch(`${GATEWAY_URL}/api/v1/files/${pathParam}`, { method: "DELETE" });
         })
       );
@@ -594,6 +590,7 @@ export default function Home() {
       try {
         localStorage.removeItem("media_service_files");
       } catch {}
+      await fetchFiles();
       setBatchNotice("All stored files removed successfully from media server.");
     } catch (err) {
       console.error("Failed to delete all files:", err);
