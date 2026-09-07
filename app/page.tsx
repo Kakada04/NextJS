@@ -42,6 +42,7 @@ export default function Home() {
   const [isDragOver, setIsDragOver] = useState(false);
   const [isMounted, setIsMounted] = useState(false);
   const [batchNotice, setBatchNotice] = useState<string | null>(null);
+  const [isDeletingAll, setIsDeletingAll] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const queueRef = useRef<UploadTask[]>([]);
@@ -125,9 +126,9 @@ export default function Home() {
     setQueue((prev) => prev.filter((item) => item.id !== id));
   };
 
-  const CHUNK_SIZE = 10 * 1024 * 1024; // 10MB per chunk to bypass Cloudflare 100MB payload limit
+  const CHUNK_SIZE = 20 * 1024 * 1024; // 20MB per chunk - smooth continuous streaming, cuts round-trip pauses in half
 
-  // Direct single-stream upload for smaller files (<= 10MB)
+  // Direct single-stream upload for smaller files (<= 20MB)
   const uploadDirectTask = async (task: UploadTask): Promise<void> => {
     return new Promise((resolve) => {
       try {
@@ -325,18 +326,25 @@ export default function Home() {
                   const timeDiff = (now - (task.lastTime || now)) / 1000;
 
                   let smoothed = task.smoothedSpeed || 0;
-                  if (timeDiff >= 0.15 || currentTotalLoaded === totalSize) {
-                    const bytesDiff = currentTotalLoaded - (task.lastLoaded || 0);
+                  if (timeDiff >= 0.1 || currentTotalLoaded === totalSize) {
+                    const bytesDiff = currentTotalLoaded - (task.lastLoaded || start);
                     const instantSpeed = timeDiff > 0 ? bytesDiff / timeDiff : 0;
-                    smoothed = smoothed === 0 ? instantSpeed : smoothed * 0.7 + instantSpeed * 0.3;
-                    task.smoothedSpeed = smoothed;
-                    task.lastTime = now;
-                    task.lastLoaded = currentTotalLoaded;
+                    if (instantSpeed > 0) {
+                      smoothed = smoothed === 0 ? instantSpeed : smoothed * 0.75 + instantSpeed * 0.25;
+                      task.smoothedSpeed = smoothed;
+                      task.lastTime = now;
+                      task.lastLoaded = currentTotalLoaded;
+                    }
                   }
 
                   const remaining = Math.max(0, totalSize - currentTotalLoaded);
                   const eta = smoothed > 0 ? Math.ceil(remaining / smoothed) : 0;
                   const progress = Math.min(99, Math.round((currentTotalLoaded / totalSize) * 100));
+
+                  const isLastChunkMerging = chunkIndex === totalChunks - 1 && event.loaded >= event.total;
+                  const chunkLabel = isLastChunkMerging
+                    ? `Stitching on server...`
+                    : `Chunk ${chunkIndex + 1}/${totalChunks}`;
 
                   setQueue((prev) =>
                     prev.map((t) =>
@@ -349,7 +357,7 @@ export default function Home() {
                             total: totalSize,
                             speedBytesPerSec: smoothed,
                             etaSec: eta,
-                            chunkInfo: `Chunk ${chunkIndex + 1}/${totalChunks}`,
+                            chunkInfo: chunkLabel,
                           }
                         : t
                     )
@@ -384,10 +392,12 @@ export default function Home() {
                 res({ ok: false, status: 0, aborted: true });
               };
 
+              // Prepare timing & open connection
+              task.lastTime = performance.now();
+              task.lastLoaded = start;
               xhr.open("POST", `${GATEWAY_URL}/api/v1/upload-chunk`);
 
               const formData = new FormData();
-              // Append fields before chunk file for streaming multipart parser
               formData.append("uploadId", uploadId);
               formData.append("chunkIndex", chunkIndex.toString());
               formData.append("totalChunks", totalChunks.toString());
@@ -546,6 +556,36 @@ export default function Home() {
       });
     } catch (err) {
       console.error("Failed to delete file:", err);
+    }
+  };
+
+  // Delete all files from server & local storage
+  const handleDeleteAll = async () => {
+    if (!files.length) return;
+    if (!confirm(`Are you sure you want to delete ALL ${files.length} stored files from the media server? This cannot be undone.`)) {
+      return;
+    }
+
+    setIsDeletingAll(true);
+    setBatchNotice(`Deleting ${files.length} files from server...`);
+    try {
+      const filesToDelete = [...files];
+      await Promise.allSettled(
+        filesToDelete.map((file) => {
+          const pathParam = file.relative_path || file.url.replace(/^\/files\//, "");
+          return fetch(`${GATEWAY_URL}/api/v1/files/${pathParam}`, { method: "DELETE" });
+        })
+      );
+      setFiles([]);
+      try {
+        localStorage.removeItem("media_service_files");
+      } catch {}
+      setBatchNotice("All stored files removed successfully from media server.");
+    } catch (err) {
+      console.error("Failed to delete all files:", err);
+      setBatchNotice("Error occurred while deleting files.");
+    } finally {
+      setIsDeletingAll(false);
     }
   };
 
@@ -932,6 +972,20 @@ export default function Home() {
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
                   </svg>
                 </button>
+
+                {files.length > 0 && (
+                  <button
+                    onClick={handleDeleteAll}
+                    disabled={isDeletingAll}
+                    className="py-1.5 px-2.5 rounded-lg border border-rose-500/30 bg-rose-500/10 hover:bg-rose-500/20 text-rose-300 text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer disabled:opacity-50"
+                    title="Delete all stored files from server"
+                  >
+                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                    </svg>
+                    {isDeletingAll ? "Deleting..." : "Delete All"}
+                  </button>
+                )}
               </div>
             </div>
 
