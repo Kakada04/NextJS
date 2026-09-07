@@ -52,6 +52,7 @@ function MediaAdminDashboard() {
   const [previewFile, setPreviewFile] = useState<FileItem | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+  const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const queueRef = useRef<UploadTask[]>([]);
@@ -710,15 +711,24 @@ function MediaAdminDashboard() {
       {/* 1. Left System Sidebar */}
       <AdminSidebar
         isOpen={isSidebarOpen}
-        totalStorageUsed={totalStorageUsed}
+        isMobileOpen={isMobileMenuOpen}
+        onCloseMobile={() => setIsMobileMenuOpen(false)}
+        currentNav={currentNav}
         totalFilesCount={files.length}
+        imagesCount={imagesCount}
+        videosCount={videosCount}
+        documentsCount={documentsCount}
+        othersCount={othersCount}
+        queueCount={queue.length}
+        totalStorageUsed={totalStorageUsed}
+        onSwitchTab={switchTab}
         onSyncNow={fetchFiles}
         onToggle={() => setIsSidebarOpen(!isSidebarOpen)}
       />
 
       {/* 2. Main Workspace */}
       <div className="flex-1 flex flex-col min-w-0 overflow-y-auto">
-        {/* Top Header with Tab Menu Bar */}
+        {/* Top Header */}
         <AdminHeader
           currentNav={currentNav}
           totalFilesCount={files.length}
@@ -737,6 +747,7 @@ function MediaAdminDashboard() {
           onSwitchTab={switchTab}
           onDeleteAll={handleDeleteAll}
           isDeletingAll={isDeletingAll}
+          onOpenMobileMenu={() => setIsMobileMenuOpen(true)}
         />
 
         {/* Notice Banner */}
