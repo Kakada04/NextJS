@@ -48,7 +48,23 @@ export default function Home() {
   const queueRef = useRef<UploadTask[]>([]);
   queueRef.current = queue;
 
-  const fetchFiles = () => {
+  const fetchFiles = async () => {
+    try {
+      const res = await fetch(`${GATEWAY_URL}/api/v1/files`);
+      if (res.ok) {
+        const data = await res.json();
+        const serverFiles: FileItem[] = data.files || [];
+        setFiles(serverFiles);
+        try {
+          localStorage.setItem("media_service_files", JSON.stringify(serverFiles));
+        } catch {}
+        return;
+      }
+    } catch (err) {
+      console.warn("Could not fetch files from API, using cached fallback:", err);
+    }
+
+    // Fallback to localStorage if offline/network issue
     try {
       if (typeof window !== "undefined") {
         const stored = localStorage.getItem("media_service_files");
@@ -56,9 +72,7 @@ export default function Home() {
           setFiles(JSON.parse(stored));
         }
       }
-    } catch (err) {
-      console.warn("Could not load files from localStorage:", err);
-    }
+    } catch {}
   };
 
   useEffect(() => {
