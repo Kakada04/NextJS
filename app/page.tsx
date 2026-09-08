@@ -10,7 +10,6 @@ import MediaGrid from "../components/MediaGrid";
 import MediaTable from "../components/MediaTable";
 import PreviewModal from "../components/PreviewModal";
 import UploadCenter from "../components/UploadCenter";
-import ApiLogDrawer, { addApiLog } from "../components/ApiLogDrawer";
 
 function MediaAdminDashboard() {
   const router = useRouter();
@@ -61,45 +60,18 @@ function MediaAdminDashboard() {
 
   // Fetch files from server API with local fallback
   const fetchFiles = async () => {
-    const start = performance.now();
     try {
       const res = await fetch(`${GATEWAY_URL}/api/v1/files`);
-      const elapsed = Math.round(performance.now() - start);
       if (res.ok) {
         const data = await res.json();
         const serverFiles: FileItem[] = data.files || [];
         setFiles(serverFiles);
-        addApiLog({
-          method: "GET",
-          endpoint: "/api/v1/files",
-          status: res.status,
-          durationMs: elapsed,
-          details: `Listed ${serverFiles.length} file(s) from ASP.NET Core`,
-          type: "success",
-        });
         try {
           localStorage.setItem("media_service_files", JSON.stringify(serverFiles));
         } catch {}
         return;
-      } else {
-        addApiLog({
-          method: "GET",
-          endpoint: "/api/v1/files",
-          status: res.status,
-          durationMs: elapsed,
-          details: `Failed to fetch files: HTTP ${res.status}`,
-          type: "error",
-        });
       }
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : "Network error";
-      addApiLog({
-        method: "GET",
-        endpoint: "/api/v1/files",
-        status: "PENDING",
-        details: `Connection failed: ${msg}`,
-        type: "error",
-      });
       console.warn("Could not fetch files from API, using cached fallback:", err);
     }
 
@@ -186,7 +158,6 @@ function MediaAdminDashboard() {
   // Direct single-stream upload for smaller files (<= 10MB)
   const uploadDirectTask = async (task: UploadTask): Promise<void> => {
     return new Promise((resolve) => {
-      const taskStartTime = performance.now();
       try {
         const formData = new FormData();
         formData.append("file", task.file);
@@ -241,17 +212,7 @@ function MediaAdminDashboard() {
         };
 
         xhr.onload = async () => {
-          const totalElapsed = Math.round(performance.now() - taskStartTime);
           if (xhr.status >= 200 && xhr.status < 300) {
-            addApiLog({
-              method: "POST",
-              endpoint: "/api/v1/upload",
-              status: xhr.status,
-              durationMs: totalElapsed,
-              details: `Uploaded '${task.file.name}' (${(task.file.size / 1024 / 1024).toFixed(2)} MB)`,
-              type: "success",
-            });
-
             setQueue((prev) =>
               prev.map((t) =>
                 t.id === task.id
@@ -273,15 +234,6 @@ function MediaAdminDashboard() {
               const err = JSON.parse(xhr.responseText);
               if (err.message || err.error) msg = err.message || err.error;
             } catch {}
-
-            addApiLog({
-              method: "POST",
-              endpoint: "/api/v1/upload",
-              status: xhr.status,
-              durationMs: totalElapsed,
-              details: `Upload failed for '${task.file.name}': ${msg}`,
-              type: "error",
-            });
 
             setQueue((prev) =>
               prev.map((t) =>
@@ -500,13 +452,6 @@ function MediaAdminDashboard() {
               fetch(`${GATEWAY_URL}/api/v1/upload-chunk/${uploadId}`, {
                 method: "DELETE",
               }).catch(() => {});
-              addApiLog({
-                method: "DELETE",
-                endpoint: `/api/v1/upload-chunk/${uploadId}`,
-                status: 200,
-                details: `Canceled chunked session for '${task.file.name}'`,
-                type: "warn",
-              });
               setQueue((prev) =>
                 prev.map((t) =>
                   t.id === task.id
@@ -525,16 +470,6 @@ function MediaAdminDashboard() {
 
             if (result.ok) {
               chunkSuccess = true;
-              addApiLog({
-                method: "POST",
-                endpoint: "/api/v1/upload-chunk",
-                status: result.status,
-                details:
-                  chunkIndex === totalChunks - 1
-                    ? `Final chunk ${chunkIndex + 1}/${totalChunks} merged for '${task.file.name}' (${(totalSize / 1024 / 1024).toFixed(2)} MB)`
-                    : `Chunk ${chunkIndex + 1}/${totalChunks} saved for '${task.file.name}'`,
-                type: "success",
-              });
               if (chunkIndex === totalChunks - 1 && result.data) {
                 setQueue((prev) =>
                   prev.map((t) =>
@@ -642,15 +577,8 @@ function MediaAdminDashboard() {
     try {
       const raw = file.relative_path || file.url.replace(/^\/files\/?/, "");
       const pathParam = raw.replace(/^\/+/, "");
-      const res = await fetch(`${GATEWAY_URL}/api/v1/files/${pathParam}`, {
+      await fetch(`${GATEWAY_URL}/api/v1/files/${pathParam}`, {
         method: "DELETE",
-      });
-      addApiLog({
-        method: "DELETE",
-        endpoint: `/api/v1/files/${pathParam}`,
-        status: res.status,
-        details: `Deleted file '${file.original_name}'`,
-        type: res.ok ? "warn" : "error",
       });
       await fetchFiles();
       if (previewFile?.file_id === file.file_id) {
@@ -684,13 +612,6 @@ function MediaAdminDashboard() {
           });
         })
       );
-      addApiLog({
-        method: "DELETE",
-        endpoint: `/api/v1/files/*`,
-        status: 200,
-        details: `Batch delete completed for ${filesToDelete.length} file(s)`,
-        type: "warn",
-      });
       setFiles([]);
       try {
         localStorage.removeItem("media_service_files");
@@ -917,8 +838,6 @@ function MediaAdminDashboard() {
         onDelete={handleDelete}
       />
 
-      {/* 4. Live ASP.NET Core API Activity Drawer */}
-      <ApiLogDrawer />
     </div>
   );
 }
